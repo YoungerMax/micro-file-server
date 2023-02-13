@@ -1,0 +1,6 @@
+HTTP file/webdav server written in 100% pure ANSI C!!
+
+Optimized for
+- speed
+- binary file size (only ~17K)
+- and least dependencies (just a UNIX C standard library)
