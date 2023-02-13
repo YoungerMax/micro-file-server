@@ -11,36 +11,52 @@
 #include <sys/types.h>
 #include <netinet/in.h>
 
-#define HOST_PORT 8080
+#define HOST_PORT 8081
 #define BACKLOG 10
 #define BUFFER_SIZE 1024
 #define PATH_BUFFER_SIZE 512
 #define METHOD_BUFFER 6 /* this probably shouldn't be changed */
+#define STATUS_CODE_SIZE 3 /* this is for readability, also probably shouldn't be changed */
+#define DIRLEN(entrylen) (entrylen * 2 + 20)
 
 int sfd;
 char running;
 
+void sendres(int cfd, const char code[STATUS_CODE_SIZE], const char* text, const char* contenttype, long contentlen)
+{
+    /* length of contentlen as a string*/
+    double lenstr = 1 + log10((double) contentlen);
+
+    /* allocate memory for response */
+    int sendlen = 9 + STATUS_CODE_SIZE + 1 + strlen(text) + 52 + strlen(contenttype) + 18 + lenstr + 4 + 1 /* +1 for \0 */;
+    char* buf = (char*) malloc(sendlen);
+
+    /* format response and send */
+    snprintf(buf, sendlen, "HTTP/1.0 %s %s\r\nConnection: closed\r\nServer: httpfs\r\nContent-Type: %s\r\nContent-Length: %i\r\n\r\n", code, text, contenttype, contentlen);
+
+    send(cfd, buf, sendlen - 1 /* -1 to remove the \0 */, 0);
+    free(buf);
+}
+
+void sendrescntnt(int cfd, const char code[STATUS_CODE_SIZE], const char* text, const char* contenttype, const char* content)
+{
+    sendres(cfd, code, text, contenttype, strlen(content));
+    send(cfd, content, strlen(content), 0);
+}
+
 void sendhttpfile(int cfd, const char* file, struct stat* statr)
 {
     int fd, readlen;
-    double numlen = 1 + log10((double) statr->st_size);
-    long alloc = 70 + numlen + 4;
     char fsendbuf[BUFFER_SIZE];
 
     /* open file */
     if ((fd = open(file, O_RDONLY)) == -1) {
-        send(cfd, "HTTP/1.0 500 Internal Server Error\r\nConnection: closed\r\nServer: httpfs\r\n\r\n", 74, 0);
-        return;   
+        sendrescntnt(cfd, "500", "Internal Server Error", "text/html", "Can't open file");
+        return;
     }
 
-    /* allocate space and send file */
-    char* httpbuf = (char*) malloc(alloc);
-
     /* send http response */
-    snprintf(httpbuf, alloc, "HTTP/1.0 200 OK\r\nConnection: closed\r\nServer: httpfs\r\nContent-Length: %i\r\n\r\n", statr->st_size);
-    
-    send(cfd, httpbuf, alloc, 0);
-    free(httpbuf);
+    sendres(cfd, "200", "OK", "application/octet-stream", statr->st_size);
 
     /* send file contents */
     while ((readlen = read(fd, fsendbuf, BUFFER_SIZE)) > 0) {
@@ -50,13 +66,13 @@ void sendhttpfile(int cfd, const char* file, struct stat* statr)
 
 void sendnf(int cfd)
 {
-    send(cfd, "HTTP/1.0 404 Not Found\r\nConnection: closed\r\nServer: httpfs\r\n\r\nNot Found", 71, 0);
+    sendrescntnt(cfd, "404", "Not Found", "text/html", "Not Found");
 }
 
 void senddirentry(int cfd, const char* entry)
 {
     size_t entrylen = strlen(entry);
-    size_t buflen = 9 + entrylen + 2 + entrylen + 9;
+    size_t buflen = DIRLEN(entrylen);
     char* buf = (char*) malloc(buflen);
 
     /* send entry as link */
@@ -69,6 +85,7 @@ void sendlistdir(int cfd, const char* dirpath)
 {
     DIR* dir;
     struct dirent* entry;
+    int size = 0;
 
     /* open directory */
     if ((dir = opendir(dirpath)) == NULL) {
@@ -77,13 +94,19 @@ void sendlistdir(int cfd, const char* dirpath)
         return;
     }
 
-    send(cfd, "HTTP/1.0 200 OK\r\nConnection: closed\r\nServer: httpfs\r\nContent-Type: text/html\r\n\r\n", 80, 0);
+    /* count for content length */
+    while ((entry = readdir(dir)) != NULL)
+        size += DIRLEN(strlen(entry->d_name));
 
-    /* iterate through directory */
-    while ((entry = readdir(dir)) != NULL) {
+    /* start http response */
+    sendres(cfd, "200", "OK", "text/html", size);
+    rewinddir(dir);
+
+    /* iterate through directory and send as HTML */
+    while ((entry = readdir(dir)) != NULL)
         senddirentry(cfd, entry->d_name);
-    }
 
+    /* clean up directory */
     closedir(dir);
 }
 
@@ -92,7 +115,7 @@ void handleget(int cfd, const char* path)
     /* result of stat */
     struct stat statr;
 
-    if (stat(path, &statr) == 0) {
+    if (stat(path, &statr) == 0)
         /* exists */
         if (S_ISREG(statr.st_mode) || S_ISLNK(statr.st_mode))
             /* send file over http */
@@ -100,10 +123,9 @@ void handleget(int cfd, const char* path)
         else if (S_ISDIR(statr.st_mode))
             /* list directory over http */
             sendlistdir(cfd, path);
-    } else {
+    else
         /* file does not exit */
         sendnf(cfd);
-    }
 }
 
 void handleput(int cfd, const char* path)
