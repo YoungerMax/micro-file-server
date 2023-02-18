@@ -1,3 +1,4 @@
+#include <dirent.h>
 #include <fcntl.h>
 #include <math.h>
 #include <signal.h>
@@ -12,7 +13,7 @@
 #include <sys/types.h>
 #include <netinet/in.h>
 
-#define HOST_PORT 8080
+#define HOST_PORT 8081
 #define BACKLOG 10
 #define BUFFER_SIZE 1024
 #define PATH_BUFFER_SIZE 512
@@ -126,6 +127,8 @@ char* http_version_as_string(enum http_version http_version)
 		case V_11:
 			return "HTTP/1.1";
 	}
+
+	return ""; 
 }
 
 char* method_as_string(enum method method)
@@ -140,6 +143,8 @@ char* method_as_string(enum method method)
 		case M_DELETE:
 			return "DELETE";
 	}
+
+	return "";
 }
 
 void print_request(struct request_t req)
@@ -190,8 +195,6 @@ void send_response(int cfd, struct response_t response)
 
 void send_response_with_content_length(int cfd, const char status_code[STATUS_CODE_SIZE], const char* status_text, const char* content_type, long content_length)
 {
-	int i;
-
 	/* length of contentlen as a string */
 	long length_of_content_length = (long) 1 + log10((double) content_length) + 1;
 	char* content_length_buffer = (char*) malloc(length_of_content_length);
@@ -262,14 +265,22 @@ void send_not_found(int cfd)
 	send_response_with_content(cfd, "404", "Not Found", "text/html", "Not found");
 }
 
-void send_directory_entry(int cfd, const char* entry)
+void send_directory_entry(int cfd, const struct dirent* entry)
 {
-	size_t entry_length = strlen(entry);
+	size_t entry_length = strlen(entry->d_name);
+
+	if (entry->d_type == DT_DIR) entry_length++;
+
 	size_t buffer_length = DIRLEN(entry_length);
 	char* send_buffer = (char*) malloc(buffer_length);
 
 	/* send entry as link */
-	snprintf(send_buffer, buffer_length, "<a href=\"%s\">%s</a><br>", entry, entry);
+	if (entry->d_type == DT_DIR) {
+		snprintf(send_buffer, buffer_length, "<a href=\"%s/\">%s/</a><br>", entry->d_name, entry->d_name);
+	} else {
+		snprintf(send_buffer, buffer_length, "<a href=\"%s\">%s</a><br>", entry->d_name, entry->d_name);
+	}
+
 	send(cfd, send_buffer, buffer_length - 1, 0); /* don't send the \0 */
 	free(send_buffer);
 }
@@ -278,7 +289,7 @@ void send_directory_listing(int cfd, const char* directory_path)
 {
 	DIR* dir;
 	struct dirent* entry;
-	size_t size = 0;
+	size_t size = 0, name_length;
 
 	/* open directory */
 	if ((dir = opendir(directory_path)) == NULL) {
@@ -289,8 +300,13 @@ void send_directory_listing(int cfd, const char* directory_path)
 	}
 
 	/* count for content length */
-	while ((entry = readdir(dir)) != NULL)
-		size += DIRLEN(strlen(entry->d_name)) - 1;
+	while ((entry = readdir(dir)) != NULL) {
+		name_length = strlen(entry->d_name);
+
+		if (entry->d_type == DT_DIR) name_length++; /* add for the "/" */
+
+		size += DIRLEN(name_length) - 1;
+	}
 	
 	/* start http response */
 	send_response_with_content_length(cfd, "200", "OK", "text/html", size);
@@ -298,7 +314,7 @@ void send_directory_listing(int cfd, const char* directory_path)
 
 	/* iterate through directory and send as HTML */
 	while ((entry = readdir(dir)) != NULL)
-		send_directory_entry(cfd, entry->d_name);
+		send_directory_entry(cfd, entry);
 		
 	/* clean up directory */
 	closedir(dir);
@@ -390,7 +406,7 @@ struct request_t parse_request(int cfd, struct sockaddr client_address)
 	ssize_t size;
 	char buffer[BUFFER_SIZE];
 	char method[METHOD_BUFFER_SIZE], path[PATH_BUFFER_SIZE], http_version[HTTP_VERSION_SIZE], header_name[HEADER_NAME_SIZE], header_value[HEADER_VALUE_SIZE];
-	int i, char_count = 0, end_char_count = 0, line_count = 0, header_name_count = 0, header_value_count = 0, fd;
+	int i, char_count = 0, end_char_count = 0, line_count = 0, header_name_count = 0, header_value_count = 0;
 	enum expecting current = E_METHOD;
 	struct request_t req = {};
 
@@ -593,8 +609,6 @@ int main(int argc, char* argv[])
 		/* handle incoming connection */
 		/* parse it */
 		struct request_t req = parse_request(cfd, client_address);
-
-		/* printreq(req); */
 
 		/* route it & send back response */
 		switch (req.method) {

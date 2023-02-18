@@ -2,7 +2,7 @@ CC=gcc
 OUTPUT=server.out
 
 build:
-	$(CC) -ansi server.c -lm -o $(OUTPUT)
+	$(CC) -ansi server.c -lm -Wall -D_DEFAULT_SOURCE -o $(OUTPUT)
 
 test: build
 	./$(OUTPUT)
