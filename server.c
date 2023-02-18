@@ -1,6 +1,7 @@
 #include <fcntl.h>
 #include <math.h>
 #include <signal.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,8 +19,14 @@
 #define HEADER_NAME_SIZE 48
 #define HEADER_VALUE_SIZE 1024
 #define MAX_HEADER_COUNT 64
-#define METHOD_BUFFER_SIZE 6 /* this probably shouldn't be changed */
-#define STATUS_CODE_SIZE 3 /* this is for readability, also probably shouldn't be changed */
+
+/* this probably shouldn't be changed */
+#define METHOD_BUFFER_SIZE 6
+
+/* these should not be changed; they are for readability */
+#define STATUS_CODE_SIZE 3
+#define HTTP_VERSION_SIZE 8
+#define HEADER_BUFFER_SIZE HEADER_NAME_SIZE + 2 + HEADER_VALUE_SIZE + 2
 #define DIRLEN(entrylen) (entrylen * 2 + 20)
 
 int sfd;
@@ -38,9 +45,16 @@ enum expecting
 
 enum method
 {
-	M_GET = 1,
+	M_GET,
 	M_PUT,
 	M_DELETE
+};
+
+enum http_version
+{
+	V_09,
+	V_10,
+	V_11
 };
 
 struct header_t
@@ -52,6 +66,7 @@ struct header_t
 struct request_t
 {
 	enum method method;
+	enum http_version http_version;
 
 	char path[PATH_BUFFER_SIZE];
 	short psize;
@@ -60,209 +75,347 @@ struct request_t
 	short hsize;
 };
 
-void printreq(struct request_t req)
+struct response_t
+{
+	enum http_version http_version;
+	
+	const char* status_code;
+	const char* status_text;
+	
+	struct header_t headers[MAX_HEADER_COUNT];
+	short header_count;
+};
+
+/* common headers */
+const struct header_t H_CONNECTION_CLOSED = {
+	.name = "Connection",
+	.value = "closed"
+};
+
+const struct header_t H_CONNECTION_KEEPALIVE = {
+	.name = "Connection",
+	.value = "keep-alive"
+};
+
+const struct header_t H_SERVER = {
+	.name = "Server",
+	.value = "httpfs"
+};
+
+
+int get_header_index(struct request_t req, const char* header)
 {
 	int i;
 
-	printf("method %u\npath %s\nhsize %i\n", req.method, req.path, req.hsize);
-
 	for (i = 0; req.hsize > i; i++)
-		printf("%s: %s\n", req.headers[i].name, req.headers[i].value);
-}
-
-int getheaderindex(struct request_t req, const char* header)
-{
-	int i;
-
-	for (i = 0; req.hsize > i; i++)
-		if (strcmp(req.headers[i].name, header)) /* TODO: double check the security of this */
+		if (strcmp(req.headers[i].name, header) == 0) /* TODO: double check the security of this */
 			return i;
 
 	return -1;
 }
 
-void sendres(int cfd, const char code[STATUS_CODE_SIZE], const char* text, const char* contenttype, long contentlen)
+char* http_version_as_string(enum http_version http_version)
 {
-	/* length of contentlen as a string*/
-	double lenstr = 1 + log10((double) contentlen);
-
-	/* allocate memory for response */
-	int sendlen = 9 + STATUS_CODE_SIZE + 1 + strlen(text) + 52 + strlen(contenttype) + 18 + lenstr + 4 + 1 /* +1 for \0 */;
-	char* buf = (char*) malloc(sendlen);
-
-	/* format response and send */
-	snprintf(buf, sendlen, "HTTP/1.0 %s %s\r\nConnection: closed\r\nServer: httpfs\r\nContent-Type: %s\r\nContent-Length: %ld\r\n\r\n", code, text, contenttype, contentlen);
-
-	send(cfd, buf, sendlen - 1 /* -1 to remove the \0 */, 0);
-	free(buf);
+	switch (http_version) {
+		case V_09:
+			return "HTTP/0.9";
+		
+		case V_10:
+			return "HTTP/1.0";
+		
+		case V_11:
+			return "HTTP/1.1";
+	}
 }
 
-void sendrescntnt(int cfd, const char code[STATUS_CODE_SIZE], const char* text, const char* contenttype, const char* content)
+char* method_as_string(enum method method)
 {
-	sendres(cfd, code, text, contenttype, strlen(content));
+	switch (method) {
+		case M_GET:
+			return "GET";
+
+		case M_PUT:
+			return "PUT";
+
+		case M_DELETE:
+			return "DELETE";
+	}
+}
+
+void print_request(struct request_t req)
+{
+	int i;
+
+	printf("%s %s %s\r\n", method_as_string(req.method), req.path, http_version_as_string(req.http_version));
+
+	for (i = 0; req.hsize > i; i++)
+		printf("%s: %s\r\n", req.headers[i].name, req.headers[i].value);
+	
+	printf("\r\n");
+}
+
+size_t get_response_length(struct response_t res)
+{
+	int i;
+	size_t s = 0;
+
+	s += HTTP_VERSION_SIZE + 1 + STATUS_CODE_SIZE + 1 + strlen(res.status_text) + 2;
+	
+	for (i = 0; res.header_count > i; i++)
+		s += strlen(res.headers[i].name) + 2 + strlen(res.headers[i].value) + 2;
+	
+	s += 2;
+	
+	return s;
+}
+
+void send_response(int cfd, struct response_t response)
+{
+	int i;
+	size_t response_length = 0, header_size;
+	char* response_buffer = (char*) malloc(get_response_length(response));
+
+	response_length += snprintf(response_buffer + response_length, HTTP_VERSION_SIZE + 1 + STATUS_CODE_SIZE + 1 + strlen(response.status_text) + 2 + 1, "%s %s %s\r\n", http_version_as_string(response.http_version), response.status_code, response.status_text);
+
+	for (i = 0; response.header_count > i; i++) {
+		header_size = strlen(response.headers[i].name) + 2 + strlen(response.headers[i].value) + 2 + 1;
+		response_length += snprintf(response_buffer + response_length, header_size, "%s: %s\r\n", response.headers[i].name, response.headers[i].value);
+	}
+
+	response_length += snprintf(response_buffer + response_length, 3, "\r\n");
+
+	send(cfd, response_buffer, response_length, 0);
+	free(response_buffer);
+}
+
+void send_response_with_content_length(int cfd, const char status_code[STATUS_CODE_SIZE], const char* status_text, const char* content_type, long content_length)
+{
+	int i;
+
+	/* length of contentlen as a string */
+	long length_of_content_length = (long) 1 + log10((double) content_length) + 1;
+	char* content_length_buffer = (char*) malloc(length_of_content_length);
+	snprintf(content_length_buffer, length_of_content_length, "%ld", content_length);
+
+	/* allocate memory for response */
+	struct response_t response = {
+		.http_version = V_11,
+		.status_code = status_code,
+		.status_text = status_text
+	};
+
+	/* content-type header */
+	struct header_t h_content_type = {
+		.name = "Content-Type"
+	};
+	
+	strncpy(h_content_type.value, content_type, strnlen(content_type, HEADER_NAME_SIZE));
+	
+	/* content-length header */
+	struct header_t h_content_length = {
+		.name = "Content-Length"
+	};
+	
+	strncpy(h_content_length.value, content_length_buffer, strnlen(content_length_buffer, HEADER_VALUE_SIZE));
+
+	/* construct response */
+	response.headers[0] = H_CONNECTION_CLOSED;
+	response.headers[1] = H_SERVER;
+	response.headers[2] = h_content_type;
+	response.headers[3] = h_content_length;
+	response.header_count = 4;
+
+	/* send response and clean up */
+	send_response(cfd, response);
+	free(content_length_buffer);
+}
+
+void send_response_with_content(int cfd, const char status_code[STATUS_CODE_SIZE], const char* status_text, const char* content_type, const char* content)
+{
+	send_response_with_content_length(cfd, status_code, status_text, content_type, strlen(content));
 	send(cfd, content, strlen(content), 0);
 }
 
-void sendhttpfile(int cfd, const char* file, struct stat* statr)
+void send_http_file(int cfd, const char* file_path, size_t file_size)
 {
-	int fd, readlen;
-	char fsendbuf[BUFFER_SIZE];
+	int fd, read_length;
+	char file_send_buffer[BUFFER_SIZE];
 
 	/* open file */
-	if ((fd = open(file, O_RDONLY)) == -1) {
-		sendrescntnt(cfd, "500", "Internal Server Error", "text/html", "Can't open file");
+	if ((fd = open(file_path, O_RDONLY)) == -1) {
+		send_response_with_content(cfd, "500", "Internal Server Error", "text/html", "Can't open file");
 		return;
 	}
 
 	/* send http response */
-	sendres(cfd, "200", "OK", "application/octet-stream", statr->st_size);
+	send_response_with_content_length(cfd, "200", "OK", "application/octet-stream", file_size);
 
 	/* send file contents */
-	while ((readlen = read(fd, fsendbuf, BUFFER_SIZE)) > 0)
-		send(cfd, fsendbuf, readlen, 0);
+	while ((read_length = read(fd, file_send_buffer, BUFFER_SIZE)) > 0)
+		send(cfd, file_send_buffer, read_length, 0);
 
 	close(fd);
 }
 
-void sendnf(int cfd)
+void send_not_found(int cfd)
 {
-	sendrescntnt(cfd, "404", "Not Found", "text/html", "Not Found");
+	send_response_with_content(cfd, "404", "Not Found", "text/html", "Not found");
 }
 
-void senddirentry(int cfd, const char* entry)
+void send_directory_entry(int cfd, const char* entry)
 {
-	size_t entrylen = strlen(entry);
-	size_t buflen = DIRLEN(entrylen);
-	char* buf = (char*) malloc(buflen);
+	size_t entry_length = strlen(entry);
+	size_t buffer_length = DIRLEN(entry_length);
+	char* send_buffer = (char*) malloc(buffer_length);
 
 	/* send entry as link */
-	snprintf(buf, buflen, "<a href=\"%s\">%s</a><br>", entry, entry);
-	send(cfd, buf, buflen-1, 0); /* don't send the \0 */
-	free(buf);
+	snprintf(send_buffer, buffer_length, "<a href=\"%s\">%s</a><br>", entry, entry);
+	send(cfd, send_buffer, buffer_length - 1, 0); /* don't send the \0 */
+	free(send_buffer);
 }
 
-void sendlistdir(int cfd, const char* dirpath)
+void send_directory_listing(int cfd, const char* directory_path)
 {
 	DIR* dir;
 	struct dirent* entry;
-	int size = 0;
+	size_t size = 0;
 
 	/* open directory */
-	if ((dir = opendir(dirpath)) == NULL) {
+	if ((dir = opendir(directory_path)) == NULL) {
 		/* not found */
-		sendnf(cfd);
+		send_not_found(cfd);
 
 		return;
 	}
 
 	/* count for content length */
 	while ((entry = readdir(dir)) != NULL)
-		size += DIRLEN(strlen(entry->d_name));
-
+		size += DIRLEN(strlen(entry->d_name)) - 1;
+	
 	/* start http response */
-	sendres(cfd, "200", "OK", "text/html", size);
+	send_response_with_content_length(cfd, "200", "OK", "text/html", size);
 	rewinddir(dir);
 
 	/* iterate through directory and send as HTML */
 	while ((entry = readdir(dir)) != NULL)
-		senddirentry(cfd, entry->d_name);
+		send_directory_entry(cfd, entry->d_name);
 		
 	/* clean up directory */
 	closedir(dir);
 }
 
-void handleget(int cfd, struct request_t req)
+void handle_get_request(int cfd, struct request_t req)
 {
 	/* result of stat */
-	struct stat statr;
+	struct stat stat_result;
 
-	if (stat(req.path, &statr) == 0) {
+	if (stat(req.path, &stat_result) == 0) {
 		/* exists */
-		if (S_ISREG(statr.st_mode) || S_ISLNK(statr.st_mode)) {
+		if (S_ISREG(stat_result.st_mode) || S_ISLNK(stat_result.st_mode)) {
 			/* send file over http */
-			sendhttpfile(cfd, req.path, &statr);
-		} else if (S_ISDIR(statr.st_mode)) {
+			send_http_file(cfd, req.path, stat_result.st_size);
+		} else if (S_ISDIR(stat_result.st_mode)) {
 			/* list directory over http */
-			sendlistdir(cfd, req.path);
+			send_directory_listing(cfd, req.path);
 		}
 	} else {
 		/* file does not exit */
-		sendnf(cfd);
+		send_not_found(cfd);
 	}
 }
 
-void handleput(int cfd, struct request_t req)
+void handle_put_request(int cfd, struct request_t req)
 {
-	int readlen, fd, clenheaderi;
-	long read, contentlen;
-	char buf[BUFFER_SIZE];
+	int read_length, fd, header_index;
+	long read_bytes, content_length;
+	char buffer[BUFFER_SIZE];
 
 	/* open file for writing, create it */
 	if (creat(req.path, 0666) < 0) {
-		sendrescntnt(cfd, "500", "Internal Server Error", "text/html", "Can't create file");
+		send_response_with_content(cfd, "500", "Internal Server Error", "text/html", "Can't create file");
 	}
 
 	if ((fd = open(req.path, O_WRONLY)) == -1) {
 		/* could not open */
-		sendrescntnt(cfd, "500", "Internal Server Error", "text/html", "Can't open file");
+		send_response_with_content(cfd, "500", "Internal Server Error", "text/html", "Can't open file");
 
 		return;
 	}
 
 	/* get content length */
-	if ((clenheaderi = getheaderindex(req, "Content-Length")) < 0) {
+	if ((header_index = get_header_index(req, "Content-Length")) == -1) {		
 		close(fd);
-		sendrescntnt(cfd, "400", "Bad Request", "text/html", "Expected Content-Length header");
+		send_response_with_content(cfd, "400", "Bad Request", "text/html", "Expected Content-Length header");
 		return;
 	}
 	
-	contentlen = atol(req.headers[clenheaderi].value);
-	
-	/* write to filesystem */
-	while ((readlen = recv(cfd, buf, BUFFER_SIZE, 0)) > 0 && contentlen > read) {
-		read += readlen;
-		write(fd, buf, readlen);
+	content_length = atol(req.headers[header_index].value);
+
+	/* get expect header */
+	if ((header_index = get_header_index(req, "Expect")) != -1) {
+		/* only directive is `100-continue` */
+		struct response_t continue_response = {
+			.http_version = V_11,
+			.status_code = "100",
+			.status_text = "Continue"
+		};
+
+		continue_response.headers[0] = H_CONNECTION_CLOSED;
+		continue_response.headers[1] = H_SERVER;
+		continue_response.header_count = 2;
+		
+		send_response(cfd, continue_response);
 	}
+
+	/* write to filesystem */
+	while ((read_length = recv(cfd, buffer, BUFFER_SIZE, 0)) > 0) {
+		read_bytes += read_length;
+		write(fd, buffer, read_length);
+
+		if (read_bytes >= content_length) break;
+	}
+
+	send_response_with_content(cfd, "201", "Created", "text/html", "Created");	
 
 	close(fd);
 }
 
-void handledel(int cfd, struct request_t req)
+void handle_delete_request(int cfd, struct request_t req)
 {
 
 }
 
-struct request_t parseconn(int cfd, struct sockaddr caddr)
+struct request_t parse_request(int cfd, struct sockaddr client_address)
 {
 	ssize_t size;
-	char buf[BUFFER_SIZE];
-	char method[METHOD_BUFFER_SIZE], path[PATH_BUFFER_SIZE], hname[HEADER_NAME_SIZE], hvalue[HEADER_VALUE_SIZE];
-	int i, charc = 0, endcharc = 0, linec = 0, hnamec = 0, hvaluec = 0, fd;
+	char buffer[BUFFER_SIZE];
+	char method[METHOD_BUFFER_SIZE], path[PATH_BUFFER_SIZE], http_version[HTTP_VERSION_SIZE], header_name[HEADER_NAME_SIZE], header_value[HEADER_VALUE_SIZE];
+	int i, char_count = 0, end_char_count = 0, line_count = 0, header_name_count = 0, header_value_count = 0, fd;
 	enum expecting current = E_METHOD;
 	struct request_t req = {};
 
 	/* reset buffers */
-	/* TOOD: replace with memset? */
 	memset(path, 0, sizeof(path));
 	memset(method, 0, sizeof(method));
+	memset(http_version, 0, sizeof(http_version));
 
 	/* receive all bytes */
 	do
 	{
-		size = recv(cfd, buf, BUFFER_SIZE, 0);
+		size = recv(cfd, buffer, BUFFER_SIZE, 0);
 
 		/* iterate through each character and process it */
 		for (i = 0; size > i; i++) {
-			char c = buf[i];
+			char c = buffer[i];
 			
 			switch (current) {
 				case E_METHOD:
 					if (c == ' ') {
 						current = E_PATH;
-						charc = 0;
+						char_count = 0;
 						continue;
-					} else if (METHOD_BUFFER_SIZE > charc) {
-						method[charc] = c;
+					} else if (METHOD_BUFFER_SIZE > char_count) {
+						method[char_count] = c;
 					} else {
 						/* TODO: too big, handle! */
 					}
@@ -272,10 +425,10 @@ struct request_t parseconn(int cfd, struct sockaddr caddr)
 				case E_PATH:
 					if (c == ' ') {
 						current = E_HTTP_VER;
-						charc = 0;
+						char_count = 0;
 						continue;
-					} else if (PATH_BUFFER_SIZE > charc) {
-						path[charc] = c;
+					} else if (PATH_BUFFER_SIZE > char_count) {
+						path[char_count] = c;
 						req.psize++;
 					} else {
 						/* TODO: too big, handle */
@@ -286,21 +439,23 @@ struct request_t parseconn(int cfd, struct sockaddr caddr)
 				case E_HTTP_VER:
 					if (c == '\r') {
 						current = E_NEW_LINE;
-						endcharc++;
+						end_char_count++;
+					} else if (HTTP_VERSION_SIZE > char_count) {
+						http_version[char_count] = c;
+					} else {
+						/* TODO: handle too big */
 					}
-
-					/* skip processing */
 
 					break;
 
 				case E_NEW_LINE:
 					if (c == '\n') {
 						current = E_HEADER_NAME;
-						endcharc++;
-						linec++;
+						end_char_count++;
+						line_count++;
 
-						memset(hname, 0, sizeof(hname));
-						memset(hvalue, 0, sizeof(hvalue));
+						memset(header_name, 0, sizeof(header_name));
+						memset(header_value, 0, sizeof(header_value));
 					}
 
 					break;
@@ -308,15 +463,15 @@ struct request_t parseconn(int cfd, struct sockaddr caddr)
 				case E_HEADER_NAME:
 					if (c == '\r') {
 						current = E_NEW_LINE;
-						endcharc++;
+						end_char_count++;
 					} else {
-						endcharc = 0;
+						end_char_count = 0;
 
 						if (c == ':') {
 							current = E_HEADER_NV_SPACE;
-						} else if (MAX_HEADER_COUNT > linec - 1 && HEADER_NAME_SIZE > hnamec) {
+						} else if (MAX_HEADER_COUNT > line_count - 1 && HEADER_NAME_SIZE > header_name_count) {
 							/* add to header buffer */
-							hname[hnamec++] = c;
+							header_name[header_name_count++] = c;
 						} else {
 							/* TODO: too big, handle */
 						}
@@ -334,22 +489,22 @@ struct request_t parseconn(int cfd, struct sockaddr caddr)
 				case E_HEADER_VAL:
 					if (c == '\r') {
 						current = E_NEW_LINE;
-						endcharc++;
+						end_char_count++;
 
 						/* add header */
-						if (MAX_HEADER_COUNT > linec - 1) {
-							strncpy(req.headers[linec - 1].name, hname, hnamec);
-							strncpy(req.headers[linec - 1].value, hvalue, hvaluec);
-							hnamec = 0;
-							hvaluec = 0;
+						if (MAX_HEADER_COUNT > line_count - 1) {
+							strncpy(req.headers[line_count - 1].name, header_name, header_name_count);
+							strncpy(req.headers[line_count - 1].value, header_value, header_value_count);
+							header_name_count = 0;
+							header_value_count = 0;
 	
 							req.hsize++;
 						}
-					} else if (MAX_HEADER_COUNT > linec - 1 && HEADER_VALUE_SIZE > hvaluec) {
-						endcharc = 0;
+					} else if (MAX_HEADER_COUNT > line_count - 1 && HEADER_VALUE_SIZE > header_value_count) {
+						end_char_count = 0;
 
 						/* add to header value buffer */
-						hvalue[hvaluec++] = c;
+						header_value[header_value_count++] = c;
 					} else {
 						/* TODO: too big, handle */
 					}
@@ -360,14 +515,21 @@ struct request_t parseconn(int cfd, struct sockaddr caddr)
 					break;
 			}
 			
-			charc++;
+			char_count++;
 		}
-	} while (size > 0 && 4 > endcharc); /* 4 end characters in a row is the header-body separator of request */
+	} while (size > 0 && 4 > end_char_count); /* 4 end characters in a row is the header-body separator of request */
 
 	/* set method */
 	if (strncmp(method, "GET", 3) == 0) req.method = M_GET;
 	else if (strncmp(method, "PUT", 3) == 0) req.method = M_PUT;
 	else if (strncmp(method, "DELETE", 6) == 0) req.method = M_DELETE;
+	/* TODO: else error */
+
+	/* set http version */
+	if (strncmp(http_version, "HTTP/0.9", 8) == 0) req.http_version = V_09;
+	else if (strncmp(http_version, "HTTP/1.0", 8) == 0) req.http_version = V_10;
+	else if (strncmp(http_version, "HTTP/1.1", 8) == 0) req.http_version = V_11;
+	/* TODO: else error */
 
 	/* set path */
 	strncpy(req.path, path, req.psize);
@@ -375,7 +537,7 @@ struct request_t parseconn(int cfd, struct sockaddr caddr)
 	return req;
 }
 
-void recvsig(int sig)
+void on_signal(int signal)
 {
 	/* stop main loop */
 	running = 0;
@@ -388,15 +550,15 @@ void recvsig(int sig)
 int main(int argc, char* argv[])
 {
 	int cfd;
-	socklen_t caddrlen;
-	struct sockaddr_in saddr;
-	struct sockaddr caddr;
+	socklen_t client_address_length;
+	struct sockaddr_in server_address;
+	struct sockaddr client_address;
 
 	/* set running state */
 	running = 1;
 
 	/* set signal callback */
-	signal(SIGINT, recvsig);
+	signal(SIGINT, on_signal);
 
 	/* create socket */    
 	if ((sfd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
@@ -405,11 +567,11 @@ int main(int argc, char* argv[])
 	}
 
 	/* bind to address */
-	saddr.sin_family = AF_INET;
-	saddr.sin_addr.s_addr = INADDR_ANY;
-	saddr.sin_port = htons(HOST_PORT);
+	server_address.sin_family = AF_INET;
+	server_address.sin_addr.s_addr = INADDR_ANY;
+	server_address.sin_port = htons(HOST_PORT);
 
-	if (bind(sfd, (struct sockaddr*) &saddr, sizeof(saddr)) < 0) {
+	if (bind(sfd, (struct sockaddr*) &server_address, sizeof(server_address)) < 0) {
 		fprintf(stderr, "httpfs: can't bind to port %i\n", HOST_PORT);
 		exit(-2);
 	}
@@ -422,7 +584,7 @@ int main(int argc, char* argv[])
 
 	/* process loop */
 	while (running) {
-		if ((cfd = accept(sfd, &caddr, &caddrlen)) < 0 && running) { /* only show warning message when not being shut down */
+		if ((cfd = accept(sfd, &client_address, &client_address_length)) < 0 && running) { /* only show warning message when not being shut down */
 			/* could not accept connection */
 			fprintf(stderr, "httpfs: warn: could not accept connection\n");
 			continue;
@@ -430,26 +592,26 @@ int main(int argc, char* argv[])
 		
 		/* handle incoming connection */
 		/* parse it */
-		struct request_t req = parseconn(cfd, caddr);
+		struct request_t req = parse_request(cfd, client_address);
 
-		printreq(req);
+		/* printreq(req); */
 
 		/* route it & send back response */
 		switch (req.method) {
 			case M_GET:
-				handleget(cfd, req);
+				handle_get_request(cfd, req);
 				break;
 
 			case M_PUT:
-				handleput(cfd, req);
+				handle_put_request(cfd, req);
 				break;
 
 			case M_DELETE:
-				handledel(cfd, req);
+				handle_delete_request(cfd, req);
 				break;
 
 			default:
-				sendrescntnt(cfd, "405", "Method Not Allowed", "text/html", "Method not allowed; only GET, PUT, and DELETE are allowed.");
+				send_response_with_content(cfd, "405", "Method Not Allowed", "text/html", "Method not allowed; only GET, PUT, and DELETE are allowed.");
 				break;
 
 		}
