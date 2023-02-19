@@ -196,7 +196,7 @@ void send_response(int cfd, struct response_t response)
 void send_response_with_content_length(int cfd, const char status_code[STATUS_CODE_SIZE], const char* status_text, const char* content_type, long content_length)
 {
 	/* length of contentlen as a string */
-	long length_of_content_length = (long) 1 + log10((double) content_length) + 1;
+	long length_of_content_length = content_length == 0 ? 1 : (long) 1 + log10((double) content_length) + 1;
 	char* content_length_buffer = (char*) malloc(length_of_content_length);
 	snprintf(content_length_buffer, length_of_content_length, "%ld", content_length);
 
@@ -241,11 +241,12 @@ void send_response_with_content(int cfd, const char status_code[STATUS_CODE_SIZE
 
 void send_http_file(int cfd, const char* file_path, size_t file_size)
 {
-	int fd, read_length;
+	size_t read_length;
+	int fd;
 	char file_send_buffer[BUFFER_SIZE];
 
 	/* open file */
-	if ((fd = open(file_path, O_RDONLY)) == -1) {
+	if ((fd = open(file_path, O_RDONLY)) < 0) {
 		send_response_with_content(cfd, "500", "Internal Server Error", "text/html", "Can't open file");
 		return;
 	}
@@ -256,7 +257,7 @@ void send_http_file(int cfd, const char* file_path, size_t file_size)
 	/* send file contents */
 	while ((read_length = read(fd, file_send_buffer, BUFFER_SIZE)) > 0)
 		send(cfd, file_send_buffer, read_length, 0);
-
+	
 	close(fd);
 }
 
