@@ -20,6 +20,7 @@
 #define HEADER_NAME_SIZE 48
 #define HEADER_VALUE_SIZE 1024
 #define MAX_HEADER_COUNT 64
+#define SERVER_NAME "micro"
 
 /* this probably shouldn't be changed */
 #define METHOD_BUFFER_SIZE 6
@@ -56,6 +57,21 @@ enum http_version
 	V_09,
 	V_10,
 	V_11
+};
+
+enum parse_error
+{
+	ERR_UNSUPPORTED_HTTP_VERSION,
+	ERR_UNSUPPORTED_METHOD,
+	ERR_METHOD_TOO_BIG,
+	ERR_PATH_TOO_BIG,
+	ERR_TOO_MANY_HEADERS,
+	ERR_HTTP_VERSION_TOO_BIG,
+	ERR_HEADER_NAME_TOO_BIG,
+	ERR_HEADER_VALUE_TOO_BIG,
+	ERR_EXPECTED_NEW_LINE,
+	ERR_EXPECTED_NAME_VALUE_SPACE,
+	ERR_EXPECTING_UNKNOWN /* this REALLY shouldn't happen, this is internal */
 };
 
 struct header_t
@@ -100,7 +116,7 @@ const struct header_t H_CONNECTION_KEEPALIVE = {
 
 const struct header_t H_SERVER = {
 	.name = "Server",
-	.value = "httpfs"
+	.value = SERVER_NAME
 };
 
 
@@ -233,6 +249,22 @@ void send_response_with_content_length(int cfd, const char status_code[STATUS_CO
 	free(content_length_buffer);
 }
 
+void send_response_basic(int cfd, const char status_code[STATUS_CODE_SIZE], const char* status_text)
+{
+	struct response_t response = {
+		.headers = {
+			H_SERVER,
+			H_CONNECTION_CLOSED
+		},
+		.header_count = 2,
+		.http_version = V_11,
+		.status_text = status_text,
+		.status_code = status_code
+	};
+
+	send_response(cfd, response);
+}
+
 void send_response_with_content(int cfd, const char status_code[STATUS_CODE_SIZE], const char* status_text, const char* content_type, const char* content)
 {
 	send_response_with_content_length(cfd, status_code, status_text, content_type, strlen(content));
@@ -263,7 +295,7 @@ void send_http_file(int cfd, const char* file_path, size_t file_size)
 
 void send_not_found(int cfd)
 {
-	send_response_with_content(cfd, "404", "Not Found", "text/html", "Not found");
+	send_response_basic(cfd, "404", "Not Found");
 }
 
 void send_directory_entry(int cfd, const struct dirent* entry)
@@ -344,7 +376,7 @@ void handle_get_request(int cfd, struct request_t req)
 void handle_put_request(int cfd, struct request_t req)
 {
 	int read_length, fd, header_index;
-	long read_bytes, content_length;
+	long read_bytes = 0, content_length;
 	char buffer[BUFFER_SIZE];
 
 	/* open file for writing, create it */
@@ -362,7 +394,7 @@ void handle_put_request(int cfd, struct request_t req)
 	/* get content length */
 	if ((header_index = get_header_index(req, "Content-Length")) == -1) {		
 		close(fd);
-		send_response_with_content(cfd, "400", "Bad Request", "text/html", "Expected Content-Length header");
+		send_response_with_content(cfd, "411", "Length Required", "text/html", "Expected Content-Length header");
 		return;
 	}
 	
@@ -371,17 +403,7 @@ void handle_put_request(int cfd, struct request_t req)
 	/* get expect header */
 	if ((header_index = get_header_index(req, "Expect")) != -1) {
 		/* only directive is `100-continue` */
-		struct response_t continue_response = {
-			.http_version = V_11,
-			.status_code = "100",
-			.status_text = "Continue"
-		};
-
-		continue_response.headers[0] = H_CONNECTION_CLOSED;
-		continue_response.headers[1] = H_SERVER;
-		continue_response.header_count = 2;
-		
-		send_response(cfd, continue_response);
+		send_response_basic(cfd, "100", "Continue");
 	}
 
 	/* write to filesystem */
@@ -392,7 +414,7 @@ void handle_put_request(int cfd, struct request_t req)
 		if (read_bytes >= content_length) break;
 	}
 
-	send_response_with_content(cfd, "201", "Created", "text/html", "Created");	
+	send_response_basic(cfd, "201", "Created");
 
 	close(fd);
 }
@@ -402,7 +424,7 @@ void handle_delete_request(int cfd, struct request_t req)
 
 }
 
-struct request_t parse_request(int cfd, struct sockaddr client_address)
+enum parse_error parse_request(int cfd, struct sockaddr client_address, struct request_t* request)
 {
 	ssize_t size;
 	char buffer[BUFFER_SIZE];
@@ -434,7 +456,7 @@ struct request_t parse_request(int cfd, struct sockaddr client_address)
 					} else if (METHOD_BUFFER_SIZE > char_count) {
 						method[char_count] = c;
 					} else {
-						/* TODO: too big, handle! */
+						return ERR_METHOD_TOO_BIG;
 					}
 
 					break;
@@ -448,7 +470,7 @@ struct request_t parse_request(int cfd, struct sockaddr client_address)
 						path[char_count] = c;
 						req.psize++;
 					} else {
-						/* TODO: too big, handle */
+						return ERR_PATH_TOO_BIG;
 					}
 
 					break;
@@ -460,7 +482,7 @@ struct request_t parse_request(int cfd, struct sockaddr client_address)
 					} else if (HTTP_VERSION_SIZE > char_count) {
 						http_version[char_count] = c;
 					} else {
-						/* TODO: handle too big */
+						return ERR_HTTP_VERSION_TOO_BIG;
 					}
 
 					break;
@@ -473,6 +495,9 @@ struct request_t parse_request(int cfd, struct sockaddr client_address)
 
 						memset(header_name, 0, sizeof(header_name));
 						memset(header_value, 0, sizeof(header_value));
+					} else {
+						/* expected new line, error */
+						return ERR_EXPECTED_NEW_LINE;
 					}
 
 					break;
@@ -490,7 +515,7 @@ struct request_t parse_request(int cfd, struct sockaddr client_address)
 							/* add to header buffer */
 							header_name[header_name_count++] = c;
 						} else {
-							/* TODO: too big, handle */
+							return ERR_HEADER_NAME_TOO_BIG;
 						}
 					}
 
@@ -499,6 +524,9 @@ struct request_t parse_request(int cfd, struct sockaddr client_address)
 				case E_HEADER_NV_SPACE:
 					if (c == ' ') {
 						current = E_HEADER_VAL;
+					} else {
+						/* expected space */
+						return ERR_EXPECTED_NAME_VALUE_SPACE;
 					}
 
 					break;
@@ -516,6 +544,9 @@ struct request_t parse_request(int cfd, struct sockaddr client_address)
 							header_value_count = 0;
 	
 							req.hsize++;
+						} else {
+							/* error: too many headers! */
+							return ERR_TOO_MANY_HEADERS;
 						}
 					} else if (MAX_HEADER_COUNT > line_count - 1 && HEADER_VALUE_SIZE > header_value_count) {
 						end_char_count = 0;
@@ -523,13 +554,13 @@ struct request_t parse_request(int cfd, struct sockaddr client_address)
 						/* add to header value buffer */
 						header_value[header_value_count++] = c;
 					} else {
-						/* TODO: too big, handle */
+						return ERR_HEADER_VALUE_TOO_BIG;
 					}
 
 					break;
 
 				default:
-					break;
+					return ERR_EXPECTING_UNKNOWN;
 			}
 			
 			char_count++;
@@ -537,21 +568,34 @@ struct request_t parse_request(int cfd, struct sockaddr client_address)
 	} while (size > 0 && 4 > end_char_count); /* 4 end characters in a row is the header-body separator of request */
 
 	/* set method */
-	if (strncmp(method, "GET", 3) == 0) req.method = M_GET;
-	else if (strncmp(method, "PUT", 3) == 0) req.method = M_PUT;
-	else if (strncmp(method, "DELETE", 6) == 0) req.method = M_DELETE;
-	/* TODO: else error */
+	if (strncmp(method, "GET", 3) == 0) {
+		req.method = M_GET;
+	} else if (strncmp(method, "PUT", 3) == 0) {
+		req.method = M_PUT;
+	} else if (strncmp(method, "DELETE", 6) == 0) {
+		req.method = M_DELETE;
+	} else {
+		return ERR_UNSUPPORTED_METHOD;
+	}
 
 	/* set http version */
-	if (strncmp(http_version, "HTTP/0.9", 8) == 0) req.http_version = V_09;
-	else if (strncmp(http_version, "HTTP/1.0", 8) == 0) req.http_version = V_10;
-	else if (strncmp(http_version, "HTTP/1.1", 8) == 0) req.http_version = V_11;
-	/* TODO: else error */
+	if (strncmp(http_version, "HTTP/0.9", 8) == 0) {
+		req.http_version = V_09;
+	} else if (strncmp(http_version, "HTTP/1.0", 8) == 0) {
+		req.http_version = V_10;
+	} else if (strncmp(http_version, "HTTP/1.1", 8) == 0) {
+		req.http_version = V_11;
+	} else {
+		return ERR_UNSUPPORTED_HTTP_VERSION;
+	}
 
 	/* set path */
 	strncpy(req.path, path, req.psize);
 
-	return req;
+	/* copy local request into the passed in pointer */
+	memcpy(request, &req, sizeof(req));
+
+	return 0;
 }
 
 void on_signal(int signal)
@@ -579,9 +623,18 @@ int main(int argc, char* argv[])
 
 	/* create socket */    
 	if ((sfd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-		fprintf(stderr, "httpfs: can't create socket\n");
+		fprintf(stderr, SERVER_NAME": can't create socket\n");
 		exit(-1);
 	}
+
+	/* allow rebinding of socket, need this as a constant value to pass as pointer */
+	const int ALLOW = 1;
+
+	if (setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, (void*) &ALLOW, sizeof(ALLOW)) < 0)
+		fprintf(stderr, SERVER_NAME": warn: can't set SO_REUSEADDR\n");
+
+	if (setsockopt(sfd, SOL_SOCKET, SO_REUSEPORT, (void*) &ALLOW, sizeof(ALLOW)) < 0) 
+		fprintf(stderr, SERVER_NAME": warn: can't set SO_REUSEPORT\n");
 
 	/* bind to address */
 	server_address.sin_family = AF_INET;
@@ -589,13 +642,13 @@ int main(int argc, char* argv[])
 	server_address.sin_port = htons(HOST_PORT);
 
 	if (bind(sfd, (struct sockaddr*) &server_address, sizeof(server_address)) < 0) {
-		fprintf(stderr, "httpfs: can't bind to port %i\n", HOST_PORT);
+		fprintf(stderr, SERVER_NAME": can't bind to port %i\n", HOST_PORT);
 		exit(-2);
 	}
 
 	/* listen */
 	if (listen(sfd, BACKLOG) < 0) {
-		fprintf(stderr, "httpfs: could not start listening on port %i\n", HOST_PORT);
+		fprintf(stderr, SERVER_NAME": could not start listening on port %i\n", HOST_PORT);
 		exit(-3);
 	}
 
@@ -603,32 +656,63 @@ int main(int argc, char* argv[])
 	while (running) {
 		if ((cfd = accept(sfd, &client_address, &client_address_length)) < 0 && running) { /* only show warning message when not being shut down */
 			/* could not accept connection */
-			fprintf(stderr, "httpfs: warn: could not accept connection\n");
+			fprintf(stderr, SERVER_NAME": warn: could not accept connection\n");
 			continue;
 		}
 		
 		/* handle incoming connection */
 		/* parse it */
-		struct request_t req = parse_request(cfd, client_address);
+		struct request_t req;
+		enum parse_error parse_error;
+		
+		if ((parse_error = parse_request(cfd, client_address, &req))) {
+			switch (parse_error) {
+				case ERR_UNSUPPORTED_HTTP_VERSION:
+				case ERR_HTTP_VERSION_TOO_BIG:
+					send_response_basic(cfd, "505", "HTTP Version Not Supported");
+					break;
 
-		/* route it & send back response */
-		switch (req.method) {
-			case M_GET:
-				handle_get_request(cfd, req);
-				break;
+				case ERR_UNSUPPORTED_METHOD:
+				case ERR_METHOD_TOO_BIG:
+					send_response_basic(cfd, "405", "Method Not Allowed");
+					break;
 
-			case M_PUT:
-				handle_put_request(cfd, req);
-				break;
+				case ERR_EXPECTING_UNKNOWN:
+					send_response_basic(cfd, "500", "Internal Server Error");
+					break;
 
-			case M_DELETE:
-				handle_delete_request(cfd, req);
-				break;
+				case ERR_TOO_MANY_HEADERS:
+				case ERR_HEADER_VALUE_TOO_BIG:
+				case ERR_HEADER_NAME_TOO_BIG:
+					send_response_basic(cfd, "431", "Request Header Fields Too Large");
+					break;
+				
+				case ERR_EXPECTED_NAME_VALUE_SPACE:
+				case ERR_EXPECTED_NEW_LINE:
+					send_response_basic(cfd, "400", "Bad Request");
+					break;
 
-			default:
-				send_response_with_content(cfd, "405", "Method Not Allowed", "text/html", "Method not allowed; only GET, PUT, and DELETE are allowed.");
-				break;
+				case ERR_PATH_TOO_BIG:
+					send_response_basic(cfd, "414", "Request-URI Too Long");
+					break;
+			}
+		} else {
+			print_request(req);
+			/* route it & send back response */
+			switch (req.method) {
+				case M_GET:
+					handle_get_request(cfd, req);
+					break;
 
+				case M_PUT:
+					handle_put_request(cfd, req);
+					break;
+
+				case M_DELETE:
+					handle_delete_request(cfd, req);
+					break;
+
+			}
 		}
 
 		/* close client */
