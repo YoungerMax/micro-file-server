@@ -10,6 +10,7 @@
 #include <sys/dir.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/types.h>
 #include <netinet/in.h>
 
@@ -479,14 +480,30 @@ void handle_put_request(int cfd, struct request_t req)
 	int read_length, fd, header_index;
 	long read_bytes = 0, content_length;
 	char buffer[BUFFER_SIZE];
+	struct statvfs fs;
 
 	/* must be authenticated */
 	if (1 > is_authenticated_http(req)) {
 		send_response_basic(cfd, "401", "Unauthorized");
 		return;
 	}
+	
+	/* get content length */
+	if ((header_index = get_header_index(req, "Content-Length")) == -1) {		
+		send_response_with_content(cfd, "411", "Length Required", "text/html", "Expected Content-Length header");
+		return;
+	}
 
-	/* TODO: add sufficient space check */
+	content_length = atol(req.headers[header_index].value);
+
+	if (statvfs(req.path, &fs) != 0) {
+		/* get space available in filesystem */	
+		printf(SERVER_NAME": warn: could not get filesystem information (space available)\n");
+	} else if (fs.f_bfree * fs.f_frsize < content_length) {
+		/* not enough space */
+		send_response_basic(cfd, "507", "Insufficient Storage");
+		return;
+	}
 
 	/* open file for writing, create it */
 	if (creat(req.path, 0666) < 0) {
@@ -499,15 +516,6 @@ void handle_put_request(int cfd, struct request_t req)
 
 		return;
 	}
-
-	/* get content length */
-	if ((header_index = get_header_index(req, "Content-Length")) == -1) {		
-		close(fd);
-		send_response_with_content(cfd, "411", "Length Required", "text/html", "Expected Content-Length header");
-		return;
-	}
-	
-	content_length = atol(req.headers[header_index].value);
 
 	/* get expect header */
 	if ((header_index = get_header_index(req, "Expect")) != -1) {
@@ -530,14 +538,24 @@ void handle_put_request(int cfd, struct request_t req)
 
 void handle_delete_request(int cfd, struct request_t req)
 {
+	struct stat stat_result;
+
 	/* must be authenticated */
 	if (1 > is_authenticated_http(req)) {
 		send_response_basic(cfd, "401", "Unauthorized");
 		return;
 	}
 
-	/* TODO: add file exists check */
-	/* TODO: add file is file and not directory check */
+	if (stat(req.path, &stat_result) == 0) {
+		/* exists */
+		if (!(S_ISREG(stat_result.st_mode) || S_ISLNK(stat_result.st_mode))) {
+			send_response_with_content(cfd, "403", "Forbidden", "text/html", "Can only delete regular files or links");
+			return;
+		}
+	} else {
+		send_not_found(cfd);
+		return;
+	}
 
 	if (remove(req.path)) {
 		send_response_basic(cfd, "500", "Internal Server Error");
