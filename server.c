@@ -1,6 +1,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <math.h>
+#include <security/_pam_types.h>
 #include <signal.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -12,6 +13,9 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <netinet/in.h>
+
+#include "auth.c"
+
 
 #define HOST_PORT 8081
 #define BACKLOG 10
@@ -103,7 +107,17 @@ struct response_t
 	short header_count;
 };
 
-/* common headers */
+const unsigned int FROM_BASE64[] = {
+    80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80,
+    80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80,
+    80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 62, 80, 80, 80, 63,
+    52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 80, 80, 80, 64, 80, 80,
+    80,  0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14,
+    15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 80, 80, 80, 80, 80,
+    80, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40,
+    41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 80, 80, 80, 80, 80
+};
+
 const struct header_t H_CONNECTION_CLOSED = {
 	.name = "Connection",
 	.value = "closed"
@@ -194,7 +208,7 @@ void send_response(int cfd, struct response_t response)
 {
 	int i;
 	size_t response_length = 0, header_size;
-	char* response_buffer = (char*) malloc(get_response_length(response));
+	char* response_buffer = malloc(get_response_length(response));
 
 	response_length += snprintf(response_buffer + response_length, HTTP_VERSION_SIZE + 1 + STATUS_CODE_SIZE + 1 + strlen(response.status_text) + 2 + 1, "%s %s %s\r\n", http_version_as_string(response.http_version), response.status_code, response.status_text);
 
@@ -213,7 +227,7 @@ void send_response_with_content_length(int cfd, const char status_code[STATUS_CO
 {
 	/* length of contentlen as a string */
 	long length_of_content_length = content_length == 0 ? 1 : (long) 1 + log10((double) content_length) + 1;
-	char* content_length_buffer = (char*) malloc(length_of_content_length);
+	char* content_length_buffer = malloc(length_of_content_length);
 	snprintf(content_length_buffer, length_of_content_length, "%ld", content_length);
 
 	/* allocate memory for response */
@@ -305,7 +319,7 @@ void send_directory_entry(int cfd, const struct dirent* entry)
 	if (entry->d_type == DT_DIR) entry_length++;
 
 	size_t buffer_length = DIRLEN(entry_length);
-	char* send_buffer = (char*) malloc(buffer_length);
+	char* send_buffer = malloc(buffer_length);
 
 	/* send entry as link */
 	if (entry->d_type == DT_DIR) {
@@ -318,8 +332,98 @@ void send_directory_entry(int cfd, const struct dirent* entry)
 	free(send_buffer);
 }
 
+/* special thanks to http://www.sunshine2k.de/articles/coding/base64/understanding_base64.html
+ * great explaination of base64
+ * original C# algorithm
+ * below is my version adapted for C
+ */
+char* base64_decode(const char* str)
+{
+	size_t len, i, actual_len;
+	char byte_1, byte_2, byte_3, byte_4;
+	size_t counter = 0;
+	char* out_str;
+
+	len = strlen(str);
+
+	/* all base64 strings must be divisible by 4 */
+	if (len % 4 != 0)
+		return NULL;
+	
+	actual_len = len / 4 * 3 + 1; /* +1 for null byte */
+	out_str = malloc(actual_len);
+
+	for (i = 0; len > i; i += 4) {
+		byte_1 = FROM_BASE64[(unsigned int) str[i]];
+		byte_2 = FROM_BASE64[(unsigned int) str[i + 1]];
+		byte_3 = FROM_BASE64[(unsigned int) str[i + 2]];
+		byte_4 = FROM_BASE64[(unsigned int) str[i + 3]];
+
+		if (str[i + 3] == '=') {	
+			if (str[i + 2] == '=') {
+				out_str[counter++] = byte_1 << 2 | ((byte_2 & 0xf0) >> 4);
+			} else {
+				out_str[counter++] = byte_1 << 2 | ((byte_2 & 0xf0) >> 4);
+				out_str[counter++] = ((byte_2 & 0x0f) << 4) | ((byte_3 & 0x3c) >> 2);
+			}
+		} else {
+			out_str[counter++] = byte_1 << 2 | ((byte_2 & 0xf0) >> 4);
+			out_str[counter++] = ((byte_2 & 0x0f) << 4) | ((byte_3 & 0x3c) >> 2);
+			out_str[counter++] = ((byte_3 & 0x03) << 6) | (byte_4 & 0x3f);
+		}
+	}
+
+	/* need null byte */
+	out_str[counter++] = '\0';
+
+	return out_str;
+}
+
+int is_authenticated_http(struct request_t req)
+{
+	int header_index;
+	char authenticated;
+	char* decoded;
+	size_t decoded_size;
+
+	if (!(header_index = get_header_index(req, "Authorization"))) {
+		return -1;
+	}
+
+	struct header_t authorization = req.headers[header_index];
+	
+	const char* schema = strtok(authorization.value, " ");
+	const char* encoded = strtok(NULL, " ");
+
+	if (schema == NULL || encoded == NULL)
+		return -2;
+
+	decoded = base64_decode(encoded);  /* [!!] this allocates, MUST free */
+	decoded_size = strlen(encoded) * sizeof(char);
+
+	if (decoded == NULL) {
+		free(decoded);
+		return -3;
+	}
+
+	const char* username = strtok(decoded, ":");
+	const char* password = strtok(NULL, ":");
+
+	if (username == NULL || password == NULL) {
+		free(decoded);
+		return -4;
+	}
+
+	authenticated = auth_backend(username, password);
+
+	free(decoded);
+
+	return authenticated;
+}
+
 void send_directory_listing(int cfd, const char* directory_path)
 {
+
 	DIR* dir;
 	struct dirent* entry;
 	size_t size = 0, name_length;
@@ -379,6 +483,14 @@ void handle_put_request(int cfd, struct request_t req)
 	long read_bytes = 0, content_length;
 	char buffer[BUFFER_SIZE];
 
+	/* must be authenticated */
+	if (1 > is_authenticated_http(req)) {
+		send_response_basic(cfd, "401", "Unauthorized");
+		return;
+	}
+
+	/* TODO: add sufficient space check */
+
 	/* open file for writing, create it */
 	if (creat(req.path, 0666) < 0) {
 		send_response_with_content(cfd, "500", "Internal Server Error", "text/html", "Can't create file");
@@ -421,7 +533,21 @@ void handle_put_request(int cfd, struct request_t req)
 
 void handle_delete_request(int cfd, struct request_t req)
 {
+	/* must be authenticated */
+	if (1 > is_authenticated_http(req)) {
+		send_response_basic(cfd, "401", "Unauthorized");
+		return;
+	}
 
+	/* TODO: add file exists check */
+	/* TODO: add file is file and not directory check */
+
+	if (remove(req.path)) {
+		send_response_basic(cfd, "500", "Internal Server Error");
+		return;
+	}
+
+	send_response_basic(cfd, "204", "No Content");
 }
 
 enum parse_error parse_request(int cfd, struct sockaddr client_address, struct request_t* request)

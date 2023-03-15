@@ -4,3 +4,10 @@ Optimized for
 - speed
 - binary file size (only ~26K)
 - and least dependencies (just a UNIX C standard library)
+
+---
+
+For Developers:
+To authenticate, use this header:
+
+Authorization: Basic c3VwZXIgc2VjcmV0IHVzZXJuYW1lOnlvdSB3b3VsZCBuZXZlciBndWVzcyB0aGlzIHBhc3N3b3Jk
