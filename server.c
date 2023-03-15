@@ -498,7 +498,7 @@ void handle_put_request(int cfd, struct request_t req)
 
 	if (statvfs(req.path, &fs) != 0) {
 		/* get space available in filesystem */	
-		printf(SERVER_NAME": warn: could not get filesystem information (space available)\n");
+		fprintf(stderr, SERVER_NAME": warn: could not get filesystem information (space available)\n");
 	} else if (fs.f_bfree * fs.f_frsize < content_length) {
 		/* not enough space */
 		send_response_basic(cfd, "507", "Insufficient Storage");
