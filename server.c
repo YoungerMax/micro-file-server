@@ -1,7 +1,6 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <math.h>
-#include <security/_pam_types.h>
 #include <signal.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -384,7 +383,6 @@ int is_authenticated_http(struct request_t req)
 	int header_index;
 	char authenticated;
 	char* decoded;
-	size_t decoded_size;
 
 	if (!(header_index = get_header_index(req, "Authorization"))) {
 		return -1;
@@ -399,7 +397,6 @@ int is_authenticated_http(struct request_t req)
 		return -2;
 
 	decoded = base64_decode(encoded);  /* [!!] this allocates, MUST free */
-	decoded_size = strlen(encoded) * sizeof(char);
 
 	if (decoded == NULL) {
 		free(decoded);
